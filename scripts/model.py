@@ -24,7 +24,7 @@ class ConvBlock(nn.Module):
 class HachimiUNet(nn.Module):
     """Lightweight U-Net: mel spectrogram -> mel spectrogram."""
 
-    def __init__(self, n_mels=128, base_ch=32):
+    def __init__(self, n_mels=80, base_ch=32):
         super().__init__()
         # Encoder
         self.enc1 = ConvBlock(1, base_ch)

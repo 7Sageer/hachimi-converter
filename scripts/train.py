@@ -1,40 +1,41 @@
 #!/usr/bin/env python3
 """Train hachimi style transfer U-Net on paired mel spectrograms."""
 
+import os
+from pathlib import Path
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 import torchaudio
-import numpy as np
-from pathlib import Path
+from mel_utils import N_MELS, log_mel, mel_spectrogram, normalize
 from model import HachimiUNet
+from torch.utils.data import DataLoader, Dataset
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "paired"
 MODEL_DIR = Path(__file__).parent.parent / "models"
 MODEL_DIR.mkdir(exist_ok=True)
 
-SR = 22050
-N_MELS = 128
-N_FFT = 2048
-HOP = 512
-# 780M iGPU hangs with conv2d under ROCm, use CPU for now
-DEVICE = "cpu"
+DEFAULT_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+def get_default_num_workers():
+    """Choose a practical default for Apple Silicon and similar CPUs."""
+    cpu_count = os.cpu_count() or 4
+    return max(2, min(8, cpu_count - 2))
 
 
 class PairedMelDataset(Dataset):
     """Load paired original/hachimi segments as mel spectrograms."""
 
-    def __init__(self, data_dir: Path, n_mels=N_MELS, sr=SR):
-        self.sr = sr
-        self.mel_transform = torchaudio.transforms.MelSpectrogram(
-            sample_rate=sr, n_fft=N_FFT, hop_length=HOP, n_mels=n_mels
-        )
-        self.amp_to_db = torchaudio.transforms.AmplitudeToDB()
-
-        # Find all pairs
+    def __init__(self, data_dir: Path, exclude_names=None):
+        # Find all pairs, optionally excluding songs by name prefix
         self.pairs = []
         hach_files = sorted(data_dir.glob("*_hach_*.wav"))
         for hf in hach_files:
+            if exclude_names and any(
+                hf.name.startswith(n + "_") for n in exclude_names
+            ):
+                continue
             of = data_dir / hf.name.replace("_hach_", "_orig_")
             if of.exists():
                 self.pairs.append((of, hf))
@@ -49,9 +50,15 @@ class PairedMelDataset(Dataset):
         orig_wav, _ = torchaudio.load(orig_path)
         hach_wav, _ = torchaudio.load(hach_path)
 
-        # To mel spectrogram (dB scale)
-        orig_mel = self.amp_to_db(self.mel_transform(orig_wav))
-        hach_mel = self.amp_to_db(self.mel_transform(hach_wav))
+        # Mono
+        if orig_wav.shape[0] > 1:
+            orig_wav = orig_wav.mean(dim=0, keepdim=True)
+        if hach_wav.shape[0] > 1:
+            hach_wav = hach_wav.mean(dim=0, keepdim=True)
+
+        # To normalized log-mel
+        orig_mel = normalize(log_mel(mel_spectrogram(orig_wav.squeeze(0))))
+        hach_mel = normalize(log_mel(mel_spectrogram(hach_wav.squeeze(0))))
 
         # Truncate to same time length
         min_t = min(orig_mel.shape[-1], hach_mel.shape[-1])
@@ -60,10 +67,7 @@ class PairedMelDataset(Dataset):
         orig_mel = self._pad_time(orig_mel[:, :, :min_t], pad_t)
         hach_mel = self._pad_time(hach_mel[:, :, :min_t], pad_t)
 
-        # Normalize to [-1, 1]
-        orig_mel = self._normalize(orig_mel)
-        hach_mel = self._normalize(hach_mel)
-
+        # mel shape is (1, 80, T) — dim 0 serves as channel for U-Net
         return orig_mel, hach_mel
 
     def _pad_time(self, mel, target_t):
@@ -72,37 +76,69 @@ class PairedMelDataset(Dataset):
             mel = nn.functional.pad(mel, [0, pad])
         return mel
 
-    def _normalize(self, mel):
-        # mel dB range is roughly [-80, 0], normalize to [-1, 1]
-        return (mel + 40) / 40  # maps -80->-1, 0->1
 
+def train(
+    epochs=120,
+    batch_size=32,
+    lr=1e-3,
+    exclude_names=None,
+    device=DEFAULT_DEVICE,
+    num_workers=None,
+    prefetch_factor=4,
+    persistent_workers=True,
+):
+    dataset = PairedMelDataset(DATA_DIR, exclude_names=exclude_names)
+    if num_workers is None:
+        num_workers = get_default_num_workers()
+    if num_workers < 0:
+        raise ValueError("--num-workers must be >= 0")
+    if prefetch_factor < 1:
+        raise ValueError("--prefetch-factor must be >= 1")
 
-def train(epochs=50, batch_size=4, lr=1e-3):
-    dataset = PairedMelDataset(DATA_DIR)
-    loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, drop_last=False)
+    use_pin_memory = device == "cuda"
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "shuffle": True,
+        "drop_last": False,
+        "num_workers": num_workers,
+        "pin_memory": use_pin_memory,
+    }
+    if num_workers > 0:
+        loader_kwargs["persistent_workers"] = persistent_workers
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+    loader = DataLoader(dataset, **loader_kwargs)
 
-    # Smaller model for CPU training
-    model = HachimiUNet(n_mels=128, base_ch=16).to(DEVICE)
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    model = HachimiUNet(n_mels=N_MELS, base_ch=32).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs, eta_min=1e-5
+    )
     criterion = nn.L1Loss()
 
-    print(f"Training on {DEVICE}, {len(dataset)} samples, {epochs} epochs")
+    print(
+        f"Training on {device}, {len(dataset)} samples, {epochs} epochs, batch={batch_size}"
+    )
     params = sum(p.numel() for p in model.parameters())
     print(f"Model params: {params:,}")
+    if num_workers > 0:
+        print(
+            f"DataLoader: workers={num_workers}, persistent={persistent_workers}, prefetch={prefetch_factor}, pin_memory={use_pin_memory}"
+        )
+    else:
+        print(f"DataLoader: workers=0, pin_memory={use_pin_memory}")
 
-    best_loss = float('inf')
+    best_loss = float("inf")
     for epoch in range(epochs):
         model.train()
         total_loss = 0
         for orig_mel, hach_mel in loader:
-            orig_mel = orig_mel.to(DEVICE)
-            hach_mel = hach_mel.to(DEVICE)
+            orig_mel = orig_mel.to(device, non_blocking=use_pin_memory)
+            hach_mel = hach_mel.to(device, non_blocking=use_pin_memory)
 
             pred = model(orig_mel)
             loss = criterion(pred, hach_mel)
 
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             loss.backward()
             optimizer.step()
             total_loss += loss.item()
@@ -110,8 +146,10 @@ def train(epochs=50, batch_size=4, lr=1e-3):
         avg_loss = total_loss / len(loader)
         scheduler.step()
 
-        if (epoch + 1) % 10 == 0:
-            print(f"  epoch {epoch+1}/{epochs}  loss={avg_loss:.4f}  lr={scheduler.get_last_lr()[0]:.6f}")
+        if (epoch + 1) % 5 == 0 or epoch == 0:
+            print(
+                f"  epoch {epoch + 1}/{epochs}  loss={avg_loss:.4f}  lr={scheduler.get_last_lr()[0]:.6f}"
+            )
 
         if avg_loss < best_loss:
             best_loss = avg_loss
@@ -123,4 +161,30 @@ def train(epochs=50, batch_size=4, lr=1e-3):
 
 
 if __name__ == "__main__":
-    train()
+    import argparse
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--epochs", type=int, default=120)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument(
+        "--device", choices=["auto", "mps", "cpu", "cuda"], default="auto"
+    )
+    parser.add_argument("--num-workers", type=int, default=None)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--no-persistent-workers", action="store_true")
+    parser.add_argument(
+        "--exclude", nargs="*", help="Song names to exclude from training"
+    )
+    args = parser.parse_args()
+    selected_device = DEFAULT_DEVICE if args.device == "auto" else args.device
+    train(
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        exclude_names=args.exclude,
+        device=selected_device,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        persistent_workers=not args.no_persistent_workers,
+    )
