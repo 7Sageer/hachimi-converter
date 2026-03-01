@@ -14,13 +14,16 @@
 # 1. 下载配对数据
 python scripts/download.py
 
-# 2. 对齐 & 切片
+# 2. 下载 HiFi-GAN vocoder 权重
+python scripts/download_vocoder.py
+
+# 3. 对齐 & 切片
 python scripts/slice_v2.py
 
-# 3. 训练
+# 4. 训练
 python scripts/train.py
 
-# 4. 推理
+# 5. 推理
 python scripts/inference.py input.wav output.wav 15
 ```
 
@@ -29,14 +32,16 @@ python scripts/inference.py input.wav output.wav 15
 - PyTorch + torchaudio
 - librosa, soundfile, matplotlib
 - yt-dlp, ffmpeg
+- gdown (vocoder 下载)
 
 ## 当前状态
 
-- v0.1: 5首歌142个配对片段，base_ch=16 U-Net，Griffin-Lim vocoder
-- 能听出"神韵"，但音质受限于 Griffin-Lim
+- v0.2: HiFi-GAN UNIVERSAL_V1 vocoder，N_MELS=80，base_ch=32 U-Net
+- mel 参数对齐 HiFi-GAN (N_FFT=1024, HOP=256, FMAX=8000)
+- 需要用新参数重训 U-Net
 
 ## TODO
 
-- [ ] 换 HiFi-GAN vocoder
 - [ ] 扩充数据到 20-30 首
-- [ ] 增大模型 + GPU 训练
+- [ ] GPU 训练
+- [x] 换 HiFi-GAN vocoder
