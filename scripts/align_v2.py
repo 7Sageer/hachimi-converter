@@ -7,7 +7,82 @@ from pathlib import Path
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 SR = 22050
-HOP = 512
+ALIGN_HOP = 512  # hop for chroma alignment — independent of mel pipeline
+
+
+def compute_normalized_chroma(y, sr=SR, hop_length=ALIGN_HOP):
+    """Compute column-normalized chroma features."""
+    chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+    return chroma / (np.linalg.norm(chroma, axis=0, keepdims=True) + 1e-8)
+
+
+def _score_window(chroma_ref, chroma_query, offset):
+    """Cosine-style mean similarity for a query window at `offset`."""
+    q_len = chroma_query.shape[1]
+    window = chroma_ref[:, offset:offset + q_len]
+    return float(np.sum(window * chroma_query) / q_len)
+
+
+def search_best_offset(chroma_ref, chroma_query, start=0, end=None, step=1):
+    """Search best offset where `chroma_query` matches inside `chroma_ref`."""
+    q_len = chroma_query.shape[1]
+    r_len = chroma_ref.shape[1]
+    max_start = r_len - q_len
+    if max_start < 0:
+        raise ValueError("query is longer than reference")
+
+    step = max(1, int(step))
+    start = max(0, int(start))
+    end = max_start if end is None else min(max_start, int(end))
+    if start > end:
+        start = end
+
+    best_offset = start
+    best_score = -1.0
+    for offset in range(start, end + 1, step):
+        score = _score_window(chroma_ref, chroma_query, offset)
+        if score > best_score:
+            best_score = score
+            best_offset = offset
+
+    if (end - start) % step != 0:
+        score = _score_window(chroma_ref, chroma_query, end)
+        if score > best_score:
+            best_score = score
+            best_offset = end
+
+    return best_offset, best_score
+
+
+def refine_local_offset(
+    chroma_orig,
+    chroma_hach,
+    hach_start_frame,
+    seg_frames,
+    expected_orig_frame,
+    search_radius_frames,
+):
+    """Refine local segment offset near expected location."""
+    if seg_frames <= 0:
+        return 0, 0.0
+
+    hach_start_frame = int(hach_start_frame)
+    seg_frames = int(seg_frames)
+    hach_end = hach_start_frame + seg_frames
+    if hach_start_frame < 0 or hach_end > chroma_hach.shape[1]:
+        return 0, 0.0
+
+    query = chroma_hach[:, hach_start_frame:hach_end]
+    max_start = chroma_orig.shape[1] - seg_frames
+    if max_start < 0:
+        return 0, 0.0
+
+    expected_orig_frame = int(np.clip(expected_orig_frame, 0, max_start))
+    radius = max(0, int(search_radius_frames))
+    start = max(0, expected_orig_frame - radius)
+    end = min(max_start, expected_orig_frame + radius)
+
+    return search_best_offset(chroma_orig, query, start=start, end=end, step=1)
 
 
 def find_alignment(orig_path, hach_path):
@@ -17,34 +92,39 @@ def find_alignment(orig_path, hach_path):
 
     print(f"  orig: {len(y_orig)/SR:.1f}s, hach: {len(y_hach)/SR:.1f}s")
 
-    # Compute chroma
-    chroma_orig = librosa.feature.chroma_cqt(y=y_orig, sr=SR, hop_length=HOP)
-    chroma_hach = librosa.feature.chroma_cqt(y=y_hach, sr=SR, hop_length=HOP)
-
-    # Normalize
-    chroma_orig = chroma_orig / (np.linalg.norm(chroma_orig, axis=0, keepdims=True) + 1e-8)
-    chroma_hach = chroma_hach / (np.linalg.norm(chroma_hach, axis=0, keepdims=True) + 1e-8)
+    chroma_orig = compute_normalized_chroma(y_orig)
+    chroma_hach = compute_normalized_chroma(y_hach)
 
     # Sliding window cross-correlation
     hach_len = chroma_hach.shape[1]
     orig_len = chroma_orig.shape[1]
+    if hach_len == 0 or orig_len == 0:
+        return 0, 0, 0.0
 
     if hach_len >= orig_len:
-        print(f"  Hachimi is longer than original, no offset search needed")
-        return 0, min(orig_len, hach_len), 1.0
+        # Do not force score=1.0; evaluate best overlap of original within hachimi.
+        _, best_score = search_best_offset(chroma_hach, chroma_orig, step=1)
+        print("  Hachimi is longer than original; using best overlap score")
+        print(f"  Best overlap score={best_score:.3f}")
+        return 0, orig_len, best_score
 
-    best_score = -1
-    best_offset = 0
+    # Two-stage search: coarse scan + local refinement.
+    coarse_step = max(1, hach_len // 20)
+    coarse_offset, _ = search_best_offset(
+        chroma_orig,
+        chroma_hach,
+        start=0,
+        end=orig_len - hach_len,
+        step=coarse_step,
+    )
+    search_start = max(0, coarse_offset - coarse_step)
+    search_end = min(orig_len - hach_len, coarse_offset + coarse_step)
+    best_offset, best_score = search_best_offset(
+        chroma_orig, chroma_hach, start=search_start, end=search_end, step=1
+    )
 
-    for offset in range(orig_len - hach_len + 1):
-        window = chroma_orig[:, offset:offset + hach_len]
-        score = np.sum(window * chroma_hach) / hach_len
-        if score > best_score:
-            best_score = score
-            best_offset = offset
-
-    offset_sec = best_offset * HOP / SR
-    duration_sec = hach_len * HOP / SR
+    offset_sec = best_offset * ALIGN_HOP / SR
+    duration_sec = hach_len * ALIGN_HOP / SR
     print(f"  Best match: offset={offset_sec:.1f}s, duration={duration_sec:.1f}s, score={best_score:.3f}")
 
     return best_offset, hach_len, best_score

@@ -12,14 +12,17 @@ OUT_DIR = DATA_DIR / "viz"
 OUT_DIR.mkdir(exist_ok=True)
 
 SR = 22050
-N_MELS = 128
-HOP = 512
+N_MELS = 80
+HOP = 256
+N_FFT = 1024
+FMAX = 8000
 DURATION = 15  # seconds to compare
 
 
 def load_mel(path: Path, duration=DURATION):
     y, sr = librosa.load(path, sr=SR, duration=duration)
-    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=N_MELS, hop_length=HOP)
+    mel = librosa.feature.melspectrogram(y=y, sr=sr, n_mels=N_MELS, hop_length=HOP,
+                                         n_fft=N_FFT, fmax=FMAX)
     mel_db = librosa.power_to_db(mel, ref=np.max)
     return mel_db, y
 
