@@ -3,4 +3,5 @@ models/
 __pycache__/
 *.pyc
 /tmp/
-
+output/
+.venv/

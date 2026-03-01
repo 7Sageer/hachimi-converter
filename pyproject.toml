@@ -1,0 +1,19 @@
+[project]
+name = "hachimi-converter"
+version = "0.1.0"
+description = "End-to-end audio style transfer pipeline for Hachimi conversion"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "gdown",
+    "librosa",
+    "matplotlib",
+    "numpy",
+    "soundfile",
+    "torch",
+    "torchaudio",
+    "yt-dlp",
+]
+
+[tool.uv]
+package = false
