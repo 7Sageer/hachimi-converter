@@ -6,12 +6,44 @@ import json
 import librosa
 import numpy as np
 from pathlib import Path
+from align_v2 import compute_normalized_chroma, search_best_offset
 
 DATA_DIR = Path(__file__).parent.parent / "data"
 PAIRS_FILE = Path(__file__).parent.parent / "pairs_full.jsonl"
 SR = 22050
 HOP = 512
 MIN_SCORE = 0.5  # pairs below this are likely mismatched
+
+
+def coarse_to_fine_best_score(chroma_ref, chroma_query):
+    """Find best score with coarse scan + local refinement."""
+    query_len = chroma_query.shape[1]
+    ref_len = chroma_ref.shape[1]
+    max_offset = ref_len - query_len
+    if max_offset < 0:
+        raise ValueError("query is longer than reference")
+    if max_offset == 0:
+        score = float(np.sum(chroma_ref * chroma_query) / query_len)
+        return 0, score
+
+    coarse_step = max(1, query_len // 20)
+    coarse_offset, _ = search_best_offset(
+        chroma_ref, chroma_query, start=0, end=max_offset, step=coarse_step
+    )
+    start = max(0, coarse_offset - coarse_step)
+    end = min(max_offset, coarse_offset + coarse_step)
+    return search_best_offset(chroma_ref, chroma_query, start=start, end=end, step=1)
+
+
+def find_hachimi_path(safe_name):
+    """Resolve hachimi audio path supporting both wav and mp3."""
+    wav_path = DATA_DIR / "hachimi" / f"{safe_name}.wav"
+    mp3_path = DATA_DIR / "hachimi" / f"{safe_name}.mp3"
+    if wav_path.exists():
+        return wav_path
+    if mp3_path.exists():
+        return mp3_path
+    return None
 
 
 def chroma_align_score(orig_path, hach_path):
@@ -22,29 +54,20 @@ def chroma_align_score(orig_path, hach_path):
     except Exception as e:
         return 0.0, str(e)
 
-    chroma_orig = librosa.feature.chroma_cqt(y=y_orig, sr=SR, hop_length=HOP)
-    chroma_hach = librosa.feature.chroma_cqt(y=y_hach, sr=SR, hop_length=HOP)
-
-    # Normalize
-    chroma_orig /= (np.linalg.norm(chroma_orig, axis=0, keepdims=True) + 1e-8)
-    chroma_hach /= (np.linalg.norm(chroma_hach, axis=0, keepdims=True) + 1e-8)
+    chroma_orig = compute_normalized_chroma(y_orig, sr=SR, hop_length=HOP)
+    chroma_hach = compute_normalized_chroma(y_hach, sr=SR, hop_length=HOP)
 
     hach_len = chroma_hach.shape[1]
     orig_len = chroma_orig.shape[1]
+    if hach_len == 0 or orig_len == 0:
+        return 0.0, "empty_audio"
 
     if hach_len >= orig_len:
-        score = np.sum(chroma_orig * chroma_hach[:, :orig_len]) / orig_len
+        _, score = coarse_to_fine_best_score(chroma_hach, chroma_orig)
         return float(score), "hachimi>=original"
 
-    best = -1.0
-    step = max(1, hach_len // 4)  # faster scan
-    for offset in range(0, orig_len - hach_len + 1, step):
-        window = chroma_orig[:, offset:offset + hach_len]
-        score = float(np.sum(window * chroma_hach) / hach_len)
-        if score > best:
-            best = score
-
-    return best, "ok"
+    _, score = coarse_to_fine_best_score(chroma_orig, chroma_hach)
+    return float(score), "ok"
 
 
 def main():
@@ -60,16 +83,23 @@ def main():
         safe = safe[:80]
 
         orig_path = DATA_DIR / "original" / f"{safe}.wav"
-        hach_path = DATA_DIR / "hachimi" / f"{safe}.mp3"
+        hach_path = find_hachimi_path(safe)
 
-        if not orig_path.exists() or not hach_path.exists():
+        if not orig_path.exists() or hach_path is None:
             print(f"[{i+1}] {name}: MISSING FILES")
             continue
 
         score, note = chroma_align_score(orig_path, hach_path)
         status = "✅" if score >= MIN_SCORE else "❌"
         print(f"[{i+1}] {status} {score:.3f}  {name}  ← {p.get('original','?')}")
-        results.append({**p, "align_score": round(score, 3), "valid": score >= MIN_SCORE})
+        results.append(
+            {
+                **p,
+                "align_score": round(score, 3),
+                "align_note": note,
+                "valid": score >= MIN_SCORE,
+            }
+        )
 
     valid = [r for r in results if r["valid"]]
     invalid = [r for r in results if not r["valid"]]
