@@ -84,12 +84,22 @@ def train(
     num_workers=None,
     prefetch_factor=4,
     persistent_workers=True,
+    amp=False,
 ):
     dataset = PairedMelDataset(DATA_DIR, exclude_names=exclude_names)
     if num_workers is None:
         num_workers = get_default_num_workers()
 
+    # CUDA 优化
     use_pin_memory = device == "cuda"
+    if device == "cuda":
+        torch.backends.cudnn.benchmark = True
+
+    # AMP 混合精度（仅 CUDA）
+    use_amp = amp and device == "cuda"
+    scaler_g = torch.amp.GradScaler("cuda", enabled=use_amp)
+    scaler_d = torch.amp.GradScaler("cuda", enabled=use_amp)
+
     loader_kwargs = {
         "batch_size": batch_size,
         "shuffle": True,
@@ -123,6 +133,8 @@ def train(
     )
     print(f"Loss: {lambda_l1}*L1 + {lambda_adv}*GAN(LSGAN)")
     print(f"Generator params: {g_params:,}  Discriminator params: {d_params:,}")
+    if use_amp:
+        print("AMP 混合精度: 已启用")
 
     best_loss = float("inf")
     for epoch in range(epochs):
@@ -137,21 +149,26 @@ def train(
             orig_mel = orig_mel.to(device, non_blocking=use_pin_memory)
             hach_mel = hach_mel.to(device, non_blocking=use_pin_memory)
 
-            fake_mel = gen(orig_mel)
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                fake_mel = gen(orig_mel)
 
             # ── Train Discriminator ──
             opt_d.zero_grad(set_to_none=True)
-            loss_d = gan_loss_d(disc, hach_mel, fake_mel)
-            loss_d.backward()
-            opt_d.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                loss_d = gan_loss_d(disc, hach_mel, fake_mel)
+            scaler_d.scale(loss_d).backward()
+            scaler_d.step(opt_d)
+            scaler_d.update()
 
             # ── Train Generator ──
             opt_g.zero_grad(set_to_none=True)
-            loss_adv = gan_loss_g(disc, fake_mel)
-            loss_l1 = criterion_l1(fake_mel, hach_mel)
-            loss_g = lambda_adv * loss_adv + lambda_l1 * loss_l1
-            loss_g.backward()
-            opt_g.step()
+            with torch.amp.autocast("cuda", enabled=use_amp):
+                loss_adv = gan_loss_g(disc, fake_mel)
+                loss_l1 = criterion_l1(fake_mel, hach_mel)
+                loss_g = lambda_adv * loss_adv + lambda_l1 * loss_l1
+            scaler_g.scale(loss_g).backward()
+            scaler_g.step(opt_g)
+            scaler_g.update()
 
             total_g += loss_g.item()
             total_d += loss_d.item()
@@ -199,6 +216,7 @@ if __name__ == "__main__":
     parser.add_argument("--num-workers", type=int, default=None)
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--no-persistent-workers", action="store_true")
+    parser.add_argument("--amp", action="store_true", help="启用混合精度训练(仅CUDA)")
     parser.add_argument(
         "--exclude", nargs="*", help="Song names to exclude from training"
     )
@@ -216,4 +234,5 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         persistent_workers=not args.no_persistent_workers,
+        amp=args.amp,
     )
