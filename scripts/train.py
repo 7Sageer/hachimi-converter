@@ -85,6 +85,8 @@ def train(
     prefetch_factor=4,
     persistent_workers=True,
     amp=False,
+    use_transformer=False,
+    tf_layers=1,
 ):
     dataset = PairedMelDataset(DATA_DIR, exclude_names=exclude_names)
     if num_workers is None:
@@ -113,7 +115,7 @@ def train(
     loader = DataLoader(dataset, **loader_kwargs)
 
     # Generator (U-Net) + Discriminator (PatchGAN)
-    gen = HachimiUNet(n_mels=N_MELS, base_ch=32).to(device)
+    gen = HachimiUNet(n_mels=N_MELS, base_ch=32, use_transformer=use_transformer, tf_layers=tf_layers).to(device)
     disc = PatchDiscriminator(in_ch=1, base_ch=32).to(device)
 
     opt_g = torch.optim.AdamW(gen.parameters(), lr=lr_g, weight_decay=1e-4)
@@ -128,8 +130,9 @@ def train(
 
     g_params = sum(p.numel() for p in gen.parameters())
     d_params = sum(p.numel() for p in disc.parameters())
+    tf_info = f", transformer={tf_layers}L" if use_transformer else ""
     print(
-        f"Training on {device}, {len(dataset)} samples, {epochs} epochs, batch={batch_size}"
+        f"Training on {device}, {len(dataset)} samples, {epochs} epochs, batch={batch_size}{tf_info}"
     )
     print(f"Loss: {lambda_l1}*L1 + {lambda_adv}*GAN(LSGAN)")
     print(f"Generator params: {g_params:,}  Discriminator params: {d_params:,}")
@@ -217,6 +220,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefetch-factor", type=int, default=4)
     parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--amp", action="store_true", help="启用混合精度训练(仅CUDA)")
+    parser.add_argument("--transformer", action="store_true", help="启用 Temporal Transformer")
+    parser.add_argument("--tf-layers", type=int, default=1, help="Transformer encoder 层数")
     parser.add_argument(
         "--exclude", nargs="*", help="Song names to exclude from training"
     )
@@ -235,4 +240,6 @@ if __name__ == "__main__":
         prefetch_factor=args.prefetch_factor,
         persistent_workers=not args.no_persistent_workers,
         amp=args.amp,
+        use_transformer=args.transformer,
+        tf_layers=args.tf_layers,
     )

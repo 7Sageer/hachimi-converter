@@ -12,6 +12,7 @@ PAIRED_DIR = DATA_DIR / "paired"
 SR = 22050
 ALIGN_HOP = 512  # hop for chroma alignment — independent of mel pipeline
 SEGMENT_SEC = 3
+OVERLAP = 0.5  # 50% overlap between segments
 LOCAL_SEARCH_SEC = 0.35
 LOCAL_MIN_SCORE = 0.35
 
@@ -31,15 +32,15 @@ def slice_pair(name, orig_path, hach_path):
     chroma_hach = compute_normalized_chroma(y_hach)
 
     seg_samples = SEGMENT_SEC * SR
+    step_samples = int(seg_samples * (1 - OVERLAP))
     seg_frames = max(1, int(round(seg_samples / ALIGN_HOP)))
     search_radius_frames = max(1, int(round(LOCAL_SEARCH_SEC * SR / ALIGN_HOP)))
-    n_segments = len(y_hach) // seg_samples
 
     count = 0
     local_scores = []
     skipped_local = 0
-    for i in range(n_segments):
-        hach_start = i * seg_samples
+    hach_start = 0
+    while hach_start + seg_samples <= len(y_hach):
         hach_end = hach_start + seg_samples
 
         hach_frame_start = int(round(hach_start / ALIGN_HOP))
@@ -54,6 +55,7 @@ def slice_pair(name, orig_path, hach_path):
         )
         if local_score < LOCAL_MIN_SCORE:
             skipped_local += 1
+            hach_start += step_samples
             continue
 
         orig_start = local_orig_frame * ALIGN_HOP
@@ -68,6 +70,7 @@ def slice_pair(name, orig_path, hach_path):
                  y_hach[hach_start:hach_end], SR)
         count += 1
         local_scores.append(local_score)
+        hach_start += step_samples
 
     if local_scores:
         print(
