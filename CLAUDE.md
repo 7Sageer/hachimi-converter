@@ -24,13 +24,18 @@ python scripts/download_vocoder.py
 # Align & slice pairs into 3-second training segments
 python scripts/slice_v2.py
 
-# Train U-Net
-python scripts/train.py                        # default 80 epochs
-python scripts/train.py --epochs 120
+# Train U-Net (GAN: L1 + PatchGAN adversarial)
+python scripts/train.py                        # default 120 epochs
+python scripts/train.py --epochs 200
 python scripts/train.py --exclude song_name    # hold out songs for eval
+python scripts/train.py --amp                  # AMP mixed precision (CUDA only)
+
+# Fine-tune HiFi-GAN vocoder on hachimi data
+python scripts/train_vocoder.py
 
 # Inference (convert audio)
 python scripts/inference.py input.wav output.wav [duration] [offset]
+python scripts/batch_inference.py              # batch convert preset samples
 
 # Visualize mel spectrogram comparison
 python scripts/visualize.py
@@ -54,8 +59,12 @@ Download scripts require a proxy at `http://localhost:10808` (hardcoded in `down
 - `scripts/mel_utils.py` — Single source of truth for mel parameters and transforms. All other scripts import from here. Functions: mel_spectrogram, log_mel, normalize, denormalize, exp_mel.
 - `scripts/model.py` — HachimiUNet: 3-level encoder-decoder with skip connections, base_ch=32, MaxPool2d(2) downsampling, ConvTranspose2d upsampling. Input/output: (B,1,80,T). Time dim must be padded to multiple of 8.
 - `scripts/hifigan_model.py` — HiFi-GAN Generator vocoder (pretrained, frozen). Expects log-mel input (B,80,T). Config at `models/hifigan/config.json`.
-- `scripts/train.py` — L1 loss, Adam lr=1e-3, cosine annealing. Device: MPS → CPU fallback. Saves best + final to `models/`.
+- `scripts/discriminator.py` — PatchDiscriminator: 2D PatchGAN on mel spectrograms, ~16-frame receptive field (~186ms).
+- `scripts/losses.py` — LSGAN loss functions for generator and discriminator.
+- `scripts/train.py` — GAN training: L1 + PatchGAN adversarial (LSGAN). AdamW, cosine annealing. Device: CUDA → MPS → CPU. Supports AMP mixed precision on CUDA. Saves best + final to `models/`.
+- `scripts/train_vocoder.py` — Fine-tunes HiFi-GAN vocoder on hachimi paired data to adapt to U-Net output distribution.
 - `scripts/inference.py` — Loads U-Net + HiFi-GAN, pads time to multiple of 8, clamps denormalized output to [-11.5, 0.5].
+- `scripts/batch_inference.py` — Batch converts preset sample list using `inference.convert()`.
 
 ### Data pipeline
 
@@ -82,6 +91,13 @@ data/
 - Mel parameters are tightly coupled to HiFi-GAN UNIVERSAL_V1 — changing them requires retraining everything.
 - `align_and_slice.py` is a legacy DTW-based approach; `align_v2.py` + `slice_v2.py` is the current pipeline.
 - Model weights are in `models/` (gitignored). Vocoder weights must be downloaded separately via `download_vocoder.py`.
-- Training device defaults to MPS (Apple Silicon); falls back to CPU.
+- Training device priority: CUDA → MPS (Apple Silicon) → CPU.
 - All scripts in `scripts/` use relative imports — run them from the `scripts/` directory or as `python scripts/foo.py`.
 - HiFi-GAN checkpoint uses `weights_only=False` (old format) — this is intentional, not a bug.
+
+## Coding Conventions
+
+- 4-space indentation, PEP 8 style. `snake_case` for functions/files, `PascalCase` for classes, `UPPER_CASE` for constants.
+- Prefer `pathlib.Path` for filesystem paths.
+- Commit style: short, imperative, lowercase summaries, often with scope (e.g. `add validate_pairs.py: chroma alignment quality check`).
+- Do not commit generated artifacts from ignored paths (`data/`, `models/`, `__pycache__/`, `/tmp/`).

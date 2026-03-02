@@ -10,6 +10,7 @@ import torch
 import torch.nn as nn
 import torchaudio
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 from hifigan_model import Generator, AttrDict
 from mel_utils import mel_spectrogram, log_mel, SR, HOP_SIZE
@@ -129,14 +130,15 @@ def train(epochs=50, batch_size=16, lr=2e-4, device=None, amp=False):
     l1_loss_fn = nn.L1Loss()
     total_steps = len(loader)
 
-    for epoch in range(epochs):
+    for epoch in tqdm(range(epochs), desc="Epochs"):
         generator.train()
         mpd.train()
         mrd.train()
         sum_g = sum_d = sum_mel = 0
         n = 0
 
-        for step, (mel_in, wav_real) in enumerate(loader):
+        pbar = tqdm(enumerate(loader), total=total_steps, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        for step, (mel_in, wav_real) in pbar:
             mel_in = mel_in.to(device, non_blocking=True)
             wav_real = wav_real.to(device, non_blocking=True).unsqueeze(1)  # (B, 1, T)
 
@@ -191,9 +193,7 @@ def train(epochs=50, batch_size=16, lr=2e-4, device=None, amp=False):
             sum_d += loss_d.item()
             sum_mel += loss_mel.item() / 45  # 记录未加权的 mel loss
             n += 1
-
-            if step % 20 == 0:
-                print(f"  [{epoch+1}/{epochs}] step {step}/{total_steps}  G={loss_g.item():.3f} D={loss_d.item():.3f} mel={loss_mel.item()/45:.4f}")
+            pbar.set_postfix(G=f"{loss_g.item():.3f}", D=f"{loss_d.item():.3f}", mel=f"{loss_mel.item()/45:.4f}")
 
         sched_g.step()
         sched_d.step()

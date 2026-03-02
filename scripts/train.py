@@ -12,6 +12,7 @@ from losses import gan_loss_d, gan_loss_g
 from mel_utils import N_MELS, log_mel, mel_spectrogram, normalize
 from model import HachimiUNet
 from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
 
 DATA_DIR = Path(__file__).parent.parent / "data" / "paired"
 MODEL_DIR = Path(__file__).parent.parent / "models"
@@ -137,7 +138,7 @@ def train(
         print("AMP 混合精度: 已启用")
 
     best_loss = float("inf")
-    for epoch in range(epochs):
+    for epoch in tqdm(range(epochs), desc="Epochs"):
         gen.train()
         disc.train()
         total_g = 0
@@ -145,7 +146,8 @@ def train(
         total_l1 = 0
         n_batches = 0
 
-        for orig_mel, hach_mel in loader:
+        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
+        for orig_mel, hach_mel in pbar:
             orig_mel = orig_mel.to(device, non_blocking=use_pin_memory)
             hach_mel = hach_mel.to(device, non_blocking=use_pin_memory)
 
@@ -174,6 +176,7 @@ def train(
             total_d += loss_d.item()
             total_l1 += loss_l1.item()
             n_batches += 1
+            pbar.set_postfix(G=f"{loss_g.item():.4f}", D=f"{loss_d.item():.4f}", L1=f"{loss_l1.item():.4f}")
 
         sched_g.step()
         sched_d.step()
