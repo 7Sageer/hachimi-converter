@@ -27,7 +27,9 @@ def download_hachimi(url, output_path, proxy=None):
     try:
         handlers = []
         if proxy:
-            handlers.append(urllib.request.ProxyHandler({"https": proxy, "http": proxy}))
+            handlers.append(
+                urllib.request.ProxyHandler({"https": proxy, "http": proxy})
+            )
         opener = urllib.request.build_opener(*handlers)
         req = urllib.request.Request(
             url,
@@ -58,6 +60,8 @@ def download_original(query, output_path, proxy=None, max_retries=3):
         "0",
         "--max-downloads",
         "1",
+        "--cookies-from-browser",
+        "chrome",
         "-o",
         str(output_path.with_suffix("")) + ".%(ext)s",
         f"ytsearch1:{query}",
@@ -86,9 +90,15 @@ def download_original(query, output_path, proxy=None, max_retries=3):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Download paired audio: hachimi from API, original from YouTube")
-    parser.add_argument("--proxy", type=str, default=None,
-                        help="HTTP proxy URL (例如 http://localhost:10808)")
+    parser = argparse.ArgumentParser(
+        description="Download paired audio: hachimi from API, original from YouTube"
+    )
+    parser.add_argument(
+        "--proxy",
+        type=str,
+        default=None,
+        help="HTTP proxy URL (例如 http://localhost:10808)",
+    )
     args = parser.parse_args()
 
     (DATA_DIR / "hachimi").mkdir(parents=True, exist_ok=True)
@@ -142,7 +152,9 @@ def main():
             delay = random.uniform(0.5, 1.5)
             time.sleep(delay)
 
-    print(f"\nDone. {ok_count}/{len(pairs)} pairs ok (skipped {skip_count} already downloaded).")
+    print(
+        f"\nDone. {ok_count}/{len(pairs)} pairs ok (skipped {skip_count} already downloaded)."
+    )
 
 
 if __name__ == "__main__":

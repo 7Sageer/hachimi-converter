@@ -34,12 +34,21 @@ class HachimiUNet(nn.Module):
         # Bottleneck
         self.bottleneck = ConvBlock(base_ch * 4, base_ch * 8)
 
-        # Decoder
-        self.up3 = nn.ConvTranspose2d(base_ch * 8, base_ch * 4, 2, stride=2)
+        # Decoder — upsample + conv to avoid checkerboard artifacts
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 8, base_ch * 4, 3, padding=1),
+        )
         self.dec3 = ConvBlock(base_ch * 8, base_ch * 4)
-        self.up2 = nn.ConvTranspose2d(base_ch * 4, base_ch * 2, 2, stride=2)
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 4, base_ch * 2, 3, padding=1),
+        )
         self.dec2 = ConvBlock(base_ch * 4, base_ch * 2)
-        self.up1 = nn.ConvTranspose2d(base_ch * 2, base_ch, 2, stride=2)
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 2, base_ch, 3, padding=1),
+        )
         self.dec1 = ConvBlock(base_ch * 2, base_ch)
 
         self.final = nn.Conv2d(base_ch, 1, 1)

@@ -80,8 +80,18 @@ def slice_pair(name, orig_path, hach_path):
     return count
 
 
+def _process_one(args):
+    """进程池 worker：处理单个歌曲对，返回 (name, count)。"""
+    name, orig_path, hach_path = args
+    n = slice_pair(name, str(orig_path), str(hach_path))
+    return name, n
+
+
 def main():
     import shutil
+    import os
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
     # Clean old paired data
     if PAIRED_DIR.exists():
         shutil.rmtree(PAIRED_DIR)
@@ -91,21 +101,26 @@ def main():
     names = [p.stem for p in (DATA_DIR / "hachimi").glob("*.wav")]
     names += [p.stem for p in (DATA_DIR / "hachimi").glob("*.mp3")]
     names = sorted(set(names))
-    total = 0
 
-    for name in sorted(names):
+    tasks = []
+    for name in names:
         orig_path = DATA_DIR / "original" / f"{name}.wav"
-        # Support both .wav and .mp3 hachimi files
         hach_path = DATA_DIR / "hachimi" / f"{name}.wav"
         if not hach_path.exists():
             hach_path = DATA_DIR / "hachimi" / f"{name}.mp3"
         if not orig_path.exists() or not hach_path.exists():
             continue
+        tasks.append((name, orig_path, hach_path))
 
-        print(f"\n[{name}]")
-        n = slice_pair(name, orig_path, hach_path)
-        print(f"  → {n} segments")
-        total += n
+    workers = min(len(tasks), os.cpu_count() or 4)
+    total = 0
+
+    with ProcessPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_process_one, t): t[0] for t in tasks}
+        for future in as_completed(futures):
+            name, n = future.result()
+            print(f"[{name}] → {n} segments")
+            total += n
 
     print(f"\nTotal: {total} paired segments in {PAIRED_DIR}/")
 
