@@ -14,10 +14,10 @@ MODEL_DIR = Path(__file__).parent.parent / "models"
 HIFIGAN_DIR = MODEL_DIR / "hifigan"
 
 
-def load_model(path=None, use_transformer=False, tf_layers=1):
+def load_model(path=None):
     if path is None:
         path = MODEL_DIR / "hachimi_unet_best.pt"
-    model = HachimiUNet(n_mels=N_MELS, base_ch=32, use_transformer=use_transformer, tf_layers=tf_layers)
+    model = HachimiUNet(n_mels=N_MELS, base_ch=32)
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     model.eval()
     return model
@@ -54,9 +54,9 @@ def load_hifigan(device="cpu", vocoder_path=None):
     return generator
 
 
-def convert(input_path: str, output_path: str, duration: float = 15.0, offset: float = 0.0, vocoder_path=None, use_transformer=False, tf_layers=1):
+def convert(input_path: str, output_path: str, duration: float = 15.0, offset: float = 0.0, vocoder_path=None):
     """Convert a segment of audio to hachimi style."""
-    model = load_model(use_transformer=use_transformer, tf_layers=tf_layers)
+    model = load_model()
     vocoder = load_hifigan(vocoder_path=vocoder_path)
 
     # Load input audio
@@ -108,7 +108,5 @@ if __name__ == "__main__":
     parser.add_argument("duration", type=float, nargs="?", default=15.0)
     parser.add_argument("offset", type=float, nargs="?", default=0.0)
     parser.add_argument("--vocoder", type=str, default=None, help="Path to vocoder checkpoint")
-    parser.add_argument("--transformer", action="store_true", help="Use transformer model")
-    parser.add_argument("--tf-layers", type=int, default=1, help="Transformer layers")
     args = parser.parse_args()
-    convert(args.input, args.output, args.duration, args.offset, vocoder_path=args.vocoder, use_transformer=args.transformer, tf_layers=args.tf_layers)
+    convert(args.input, args.output, args.duration, args.offset, vocoder_path=args.vocoder)

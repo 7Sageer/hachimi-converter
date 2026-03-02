@@ -3,7 +3,6 @@
 
 import torch
 import torch.nn as nn
-import math
 
 
 class ConvBlock(nn.Module):
@@ -22,41 +21,11 @@ class ConvBlock(nn.Module):
         return self.conv(x)
 
 
-class TemporalTransformer(nn.Module):
-    """Lightweight temporal self-attention on bottleneck features.
-
-    Projects C*H down to attn_dim before attention to keep params manageable.
-    """
-
-    def __init__(self, full_dim, attn_dim=256, nhead=4, num_layers=1, dropout=0.1):
-        super().__init__()
-        self.proj_in = nn.Linear(full_dim, attn_dim)
-        self.proj_out = nn.Linear(attn_dim, full_dim)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=attn_dim, nhead=nhead,
-            dim_feedforward=attn_dim * 2,
-            dropout=dropout, batch_first=True,
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
-
-    def forward(self, x):
-        # x: (B, C, H, T) -> attend along T
-        B, C, H, T = x.shape
-        x = x.permute(0, 3, 1, 2).reshape(B, T, C * H)  # (B, T, C*H)
-        x = self.proj_in(x)   # (B, T, attn_dim)
-        x = self.encoder(x)
-        x = self.proj_out(x)  # (B, T, C*H)
-        x = x.reshape(B, T, C, H).permute(0, 2, 3, 1)  # (B, C, H, T)
-        return x
-
-
 class HachimiUNet(nn.Module):
     """Lightweight U-Net: mel spectrogram -> mel spectrogram."""
 
-    def __init__(self, n_mels=80, base_ch=32, use_transformer=False, tf_layers=1):
+    def __init__(self, n_mels=80, base_ch=32):
         super().__init__()
-        self.use_transformer = use_transformer
-
         # Encoder
         self.enc1 = ConvBlock(1, base_ch)
         self.enc2 = ConvBlock(base_ch, base_ch * 2)
@@ -64,15 +33,6 @@ class HachimiUNet(nn.Module):
 
         # Bottleneck
         self.bottleneck = ConvBlock(base_ch * 4, base_ch * 8)
-
-        # Temporal Transformer (on bottleneck output)
-        if use_transformer:
-            bt_h = n_mels // 8  # after 3 poolings
-            self.temporal_tf = TemporalTransformer(
-                full_dim=base_ch * 8 * bt_h,
-                attn_dim=256, nhead=4,
-                num_layers=tf_layers, dropout=0.15,
-            )
 
         # Decoder — upsample + conv to avoid checkerboard artifacts
         self.up3 = nn.Sequential(
@@ -101,9 +61,6 @@ class HachimiUNet(nn.Module):
         e3 = self.enc3(self.pool(e2))
 
         b = self.bottleneck(self.pool(e3))
-
-        if self.use_transformer:
-            b = b + self.temporal_tf(b)  # residual connection
 
         d3 = self.up3(b)
         d3 = self._pad_cat(d3, e3)
