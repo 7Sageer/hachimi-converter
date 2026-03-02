@@ -23,10 +23,17 @@ def load_model(path=None):
     return model
 
 
-def load_hifigan(device="cpu"):
-    """Load pretrained HiFi-GAN UNIVERSAL_V1 generator."""
+def load_hifigan(device="cpu", vocoder_path=None):
+    """Load HiFi-GAN generator. Uses finetuned model if available."""
     config_path = HIFIGAN_DIR / "config.json"
-    ckpt_path = HIFIGAN_DIR / "generator_v1"
+
+    # 优先级：指定路径 > 微调模型 > 预训练模型
+    if vocoder_path is not None:
+        ckpt_path = Path(vocoder_path)
+    elif (HIFIGAN_DIR / "generator_v1_finetuned").exists():
+        ckpt_path = HIFIGAN_DIR / "generator_v1_finetuned"
+    else:
+        ckpt_path = HIFIGAN_DIR / "generator_v1"
 
     if not ckpt_path.exists():
         raise FileNotFoundError(
@@ -43,13 +50,14 @@ def load_hifigan(device="cpu"):
     generator.load_state_dict(ckpt["generator"])
     generator.eval()
     generator.remove_weight_norm()
+    print(f"Loaded vocoder: {ckpt_path.name}")
     return generator
 
 
-def convert(input_path: str, output_path: str, duration: float = 15.0, offset: float = 0.0):
+def convert(input_path: str, output_path: str, duration: float = 15.0, offset: float = 0.0, vocoder_path=None):
     """Convert a segment of audio to hachimi style."""
     model = load_model()
-    vocoder = load_hifigan()
+    vocoder = load_hifigan(vocoder_path=vocoder_path)
 
     # Load input audio
     wav, orig_sr = torchaudio.load(input_path)
@@ -93,10 +101,12 @@ def convert(input_path: str, output_path: str, duration: float = 15.0, offset: f
 
 
 if __name__ == "__main__":
-    import sys
-    if len(sys.argv) < 3:
-        print("Usage: python inference.py <input.wav> <output.wav> [duration_sec] [offset_sec]")
-        sys.exit(1)
-    dur = float(sys.argv[3]) if len(sys.argv) > 3 else 15.0
-    off = float(sys.argv[4]) if len(sys.argv) > 4 else 0.0
-    convert(sys.argv[1], sys.argv[2], dur, off)
+    import argparse
+    parser = argparse.ArgumentParser(description="Convert audio to hachimi style")
+    parser.add_argument("input", help="Input wav file")
+    parser.add_argument("output", help="Output wav file")
+    parser.add_argument("duration", type=float, nargs="?", default=15.0)
+    parser.add_argument("offset", type=float, nargs="?", default=0.0)
+    parser.add_argument("--vocoder", type=str, default=None, help="Path to vocoder checkpoint")
+    args = parser.parse_args()
+    convert(args.input, args.output, args.duration, args.offset, vocoder_path=args.vocoder)

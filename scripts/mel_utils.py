@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Shared mel spectrogram utilities aligned with HiFi-GAN UNIVERSAL_V1 parameters."""
 
+import warnings
 import torch
 import torch.utils.data
 from librosa.filters import mel as librosa_mel_fn
+
+warnings.filterwarnings("ignore", message=".*An output with one or more elements was resized.*")
 
 # ── Audio constants (match HiFi-GAN UNIVERSAL_V1) ──
 SR = 22050
