@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train hachimi style transfer U-Net with PatchGAN adversarial loss."""
+"""Train hachimi style transfer Conformer with PatchGAN adversarial loss."""
 
 import os
 from pathlib import Path
@@ -10,7 +10,7 @@ import torchaudio
 from discriminator import PatchDiscriminator
 from losses import gan_loss_d, gan_loss_g
 from mel_utils import N_MELS, log_mel, mel_spectrogram, normalize
-from model import HachimiUNet
+from model import HachimiConformer
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -113,18 +113,21 @@ def train(
         loader_kwargs["prefetch_factor"] = prefetch_factor
     loader = DataLoader(dataset, **loader_kwargs)
 
-    # Generator (U-Net) + Discriminator (PatchGAN)
-    gen = HachimiUNet(n_mels=N_MELS, base_ch=32).to(device)
+    # Generator (Conformer) + Discriminator (PatchGAN)
+    gen = HachimiConformer(n_mels=N_MELS).to(device)
     disc = PatchDiscriminator(in_ch=1, base_ch=32).to(device)
 
     opt_g = torch.optim.AdamW(gen.parameters(), lr=lr_g, weight_decay=1e-4)
     opt_d = torch.optim.AdamW(disc.parameters(), lr=lr_d, weight_decay=1e-4)
-    sched_g = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt_g, T_max=epochs, eta_min=1e-5
-    )
-    sched_d = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt_d, T_max=epochs, eta_min=1e-6
-    )
+    warmup_epochs = min(10, epochs // 10)
+    sched_g = torch.optim.lr_scheduler.SequentialLR(opt_g, [
+        torch.optim.lr_scheduler.LinearLR(opt_g, start_factor=0.01, total_iters=warmup_epochs),
+        torch.optim.lr_scheduler.CosineAnnealingLR(opt_g, T_max=epochs - warmup_epochs, eta_min=1e-5),
+    ], milestones=[warmup_epochs])
+    sched_d = torch.optim.lr_scheduler.SequentialLR(opt_d, [
+        torch.optim.lr_scheduler.LinearLR(opt_d, start_factor=0.01, total_iters=warmup_epochs),
+        torch.optim.lr_scheduler.CosineAnnealingLR(opt_d, T_max=epochs - warmup_epochs, eta_min=1e-6),
+    ], milestones=[warmup_epochs])
     criterion_l1 = nn.L1Loss()
 
     g_params = sum(p.numel() for p in gen.parameters())

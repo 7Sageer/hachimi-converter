@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Convert audio to hachimi style using trained U-Net."""
+"""Convert audio to hachimi style using trained Conformer."""
 
 import json
 import torch
 import torchaudio
 import soundfile as sf
 from pathlib import Path
-from model import HachimiUNet
+from model import HachimiConformer
 from hifigan_model import Generator, AttrDict
 from mel_utils import mel_spectrogram, log_mel, normalize, denormalize, SR, N_MELS
 
@@ -17,7 +17,7 @@ HIFIGAN_DIR = MODEL_DIR / "hifigan"
 def load_model(path=None):
     if path is None:
         path = MODEL_DIR / "hachimi_unet_best.pt"
-    model = HachimiUNet(n_mels=N_MELS, base_ch=32)
+    model = HachimiConformer(n_mels=N_MELS)
     model.load_state_dict(torch.load(path, map_location="cpu", weights_only=True))
     model.eval()
     return model
@@ -82,7 +82,7 @@ def convert(input_path: str, output_path: str, duration: float = 15.0, offset: f
     if pad_t > t:
         mel = torch.nn.functional.pad(mel, [0, pad_t - t])
 
-    # U-Net inference
+    # Conformer inference
     with torch.no_grad():
         pred = model(mel)
 

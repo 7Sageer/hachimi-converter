@@ -41,7 +41,7 @@ python scripts/batch_inference.py              # batch convert preset samples
 python scripts/visualize.py
 ```
 
-No test suite exists. No requirements.txt — dependencies are PyTorch, torchaudio, librosa, soundfile, matplotlib, yt-dlp, ffmpeg, gdown.
+No test suite exists. The project uses uv for dependency management. Dependencies: PyTorch, torchaudio, librosa, soundfile, matplotlib, yt-dlp, ffmpeg, gdown.
 
 Download scripts require a proxy at `http://localhost:10808` (hardcoded in `download.py` and `download_v2.py`).
 

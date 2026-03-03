@@ -29,6 +29,8 @@ python scripts/inference.py input.wav output.wav 15
 
 ## 依赖
 
+项目使用 [uv](https://docs.astral.sh/uv/) 进行依赖管理。
+
 - PyTorch + torchaudio
 - librosa, soundfile, matplotlib
 - yt-dlp, ffmpeg
