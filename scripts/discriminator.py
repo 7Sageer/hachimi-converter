@@ -4,6 +4,8 @@
 Classifies local patches of mel spectrograms as real or generated.
 Small receptive field forces the generator to produce realistic local
 temporal dynamics rather than smooth averages.
+
+forward() 返回 (final_logit, [中间特征列表])，用于 feature matching loss。
 """
 
 import torch.nn as nn
@@ -13,7 +15,9 @@ class PatchDiscriminator(nn.Module):
     """2D PatchGAN discriminator operating on mel spectrograms.
 
     Input: (B, 1, 80, T) — single-channel mel spectrogram.
-    Output: (B, 1, H', T') — per-patch real/fake logits.
+    Output: (logits, [feat1, feat2, feat3])
+      - logits: (B, 1, H', T') — per-patch real/fake logits.
+      - feats: 各中间层输出，用于 feature matching loss。
 
     Uses 4 conv layers with stride-2 to get ~16-frame receptive field
     (~186ms at hop=256, sr=22050), matching the temporal scale where
@@ -22,21 +26,34 @@ class PatchDiscriminator(nn.Module):
 
     def __init__(self, in_ch=1, base_ch=32):
         super().__init__()
-        self.net = nn.Sequential(
+        # 拆分为独立层，方便取中间特征
+        self.layer1 = nn.Sequential(
             # (B, 1, 80, T) -> (B, 32, 40, T/2)
             nn.Conv2d(in_ch, base_ch, 4, stride=2, padding=1),
             nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.layer2 = nn.Sequential(
             # -> (B, 64, 20, T/4)
             nn.Conv2d(base_ch, base_ch * 2, 4, stride=2, padding=1),
             nn.InstanceNorm2d(base_ch * 2),
             nn.LeakyReLU(0.2, inplace=True),
+        )
+        self.layer3 = nn.Sequential(
             # -> (B, 128, 10, T/8)
             nn.Conv2d(base_ch * 2, base_ch * 4, 4, stride=2, padding=1),
             nn.InstanceNorm2d(base_ch * 4),
             nn.LeakyReLU(0.2, inplace=True),
-            # -> (B, 1, 10, T/8) — per-patch logit
-            nn.Conv2d(base_ch * 4, 1, 3, padding=1),
         )
+        # -> (B, 1, 10, T/8) — per-patch logit
+        self.output = nn.Conv2d(base_ch * 4, 1, 3, padding=1)
 
     def forward(self, x):
-        return self.net(x)
+        feats = []
+        x = self.layer1(x)
+        feats.append(x)
+        x = self.layer2(x)
+        feats.append(x)
+        x = self.layer3(x)
+        feats.append(x)
+        logits = self.output(x)
+        return logits, feats

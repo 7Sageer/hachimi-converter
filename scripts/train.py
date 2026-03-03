@@ -3,11 +3,14 @@
 
 from pathlib import Path
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torchaudio
 from discriminator import PatchDiscriminator
-from losses import gan_loss_d, gan_loss_g
+from losses import gan_loss_d, gan_loss_g, feature_matching_loss
 from mel_utils import N_MELS, log_mel, mel_spectrogram, normalize
 from model import HachimiConformer
 from torch.utils.data import DataLoader, Dataset
@@ -74,13 +77,63 @@ class PairedMelDataset(Dataset):
         return mel
 
 
+def plot_curves(history, save_path):
+    """绘制训练曲线并保存。"""
+    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    fig.suptitle("Training Curves", fontsize=14, fontweight="bold")
+    epochs = range(1, len(history["g"]) + 1)
+
+    # 左上：G/D loss
+    ax = axes[0, 0]
+    ax.plot(epochs, history["g"], label="G (total)", linewidth=1.5)
+    ax.plot(epochs, history["d"], label="D", linewidth=1.5)
+    ax.set_title("Generator / Discriminator Loss")
+    ax.set_xlabel("Epoch")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 右上：分项 loss（未乘 lambda 的原始量级）
+    ax = axes[0, 1]
+    ax.plot(epochs, history["l1"], label="L1", linewidth=1.5)
+    ax.plot(epochs, history["adv"], label="adv", linewidth=1.5)
+    ax.plot(epochs, history["fm"], label="FM", linewidth=1.5)
+    ax.set_title("Loss Components (raw, unweighted)")
+    ax.set_xlabel("Epoch")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    # 左下：delta 幅度
+    ax = axes[1, 0]
+    ax.plot(epochs, history["delta"], color="tab:orange", linewidth=1.5)
+    ax.set_title("Delta Magnitude (|output - input|)")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("mean |δ|")
+    ax.grid(True, alpha=0.3)
+
+    # 右下：学习率
+    ax = axes[1, 1]
+    ax.plot(epochs, history["lr_g"], label="lr_g", linewidth=1.5)
+    ax.plot(epochs, history["lr_d"], label="lr_d", linewidth=1.5)
+    ax.set_title("Learning Rate Schedule")
+    ax.set_xlabel("Epoch")
+    ax.set_yscale("log")
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Training curves saved: {save_path}")
+
+
 def train(
     epochs=120,
     batch_size=32,
     lr_g=1e-3,
-    lr_d=1e-4,
-    lambda_l1=10.0,
-    lambda_adv=1.0,
+    lr_d=5e-4,
+    lambda_l1=2.0,
+    lambda_adv=2.0,
+    lambda_fm=2.0,
     exclude_names=None,
     device=DEFAULT_DEVICE,
     amp=False,
@@ -128,27 +181,31 @@ def train(
     print(
         f"Training on {device}, {len(dataset)} samples, {epochs} epochs, batch={batch_size}"
     )
-    print(f"Loss: {lambda_l1}*L1 + {lambda_adv}*GAN(LSGAN)")
+    print(f"Loss: {lambda_l1}*L1 + {lambda_adv}*adv + {lambda_fm}*FM  |  lr_g={lr_g}, lr_d={lr_d}")
     print(f"Generator params: {g_params:,}  Discriminator params: {d_params:,}")
     if use_amp:
         print("AMP 混合精度: 已启用")
 
+    # 训练历史（用于绘图）
+    history = {"g": [], "d": [], "l1": [], "adv": [], "fm": [], "delta": [], "lr_g": [], "lr_d": []}
     best_loss = float("inf")
-    for epoch in tqdm(range(epochs), desc="Epochs"):
+
+    for epoch in tqdm(range(epochs), desc="Training"):
         gen.train()
         disc.train()
-        total_g = 0
-        total_d = 0
-        total_l1 = 0
+        total_g = total_d = total_l1 = total_adv = total_fm = total_delta = 0.0
         n_batches = 0
 
-        pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
-        for orig_mel, hach_mel in pbar:
+        for orig_mel, hach_mel in loader:
             orig_mel = orig_mel.to(device, non_blocking=True)
             hach_mel = hach_mel.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 fake_mel = gen(orig_mel)
+
+            # 监控 delta 幅度（global residual: fake = orig + delta）
+            with torch.no_grad():
+                delta_mag = (fake_mel - orig_mel).abs().mean().item()
 
             # ── Train Discriminator ──
             opt_d.zero_grad(set_to_none=True)
@@ -161,9 +218,10 @@ def train(
             # ── Train Generator ──
             opt_g.zero_grad(set_to_none=True)
             with torch.amp.autocast("cuda", enabled=use_amp):
-                loss_adv = gan_loss_g(disc, fake_mel)
+                loss_adv, fake_feats = gan_loss_g(disc, fake_mel)
+                loss_fm = feature_matching_loss(disc, hach_mel, fake_feats)
                 loss_l1 = criterion_l1(fake_mel, hach_mel)
-                loss_g = lambda_adv * loss_adv + lambda_l1 * loss_l1
+                loss_g = lambda_adv * loss_adv + lambda_l1 * loss_l1 + lambda_fm * loss_fm
             scaler_g.scale(loss_g).backward()
             scaler_g.step(opt_g)
             scaler_g.update()
@@ -171,31 +229,45 @@ def train(
             total_g += loss_g.item()
             total_d += loss_d.item()
             total_l1 += loss_l1.item()
+            total_adv += loss_adv.item()
+            total_fm += loss_fm.item()
+            total_delta += delta_mag
             n_batches += 1
-            pbar.set_postfix(G=f"{loss_g.item():.4f}", D=f"{loss_d.item():.4f}", L1=f"{loss_l1.item():.4f}")
 
         sched_g.step()
         sched_d.step()
 
-        avg_g = total_g / n_batches
-        avg_d = total_d / n_batches
-        avg_l1 = total_l1 / n_batches
+        avg = {k: v / n_batches for k, v in zip(
+            ["g", "d", "l1", "adv", "fm", "delta"],
+            [total_g, total_d, total_l1, total_adv, total_fm, total_delta],
+        )}
+        for k, v in avg.items():
+            history[k].append(v)
+        history["lr_g"].append(sched_g.get_last_lr()[0])
+        history["lr_d"].append(sched_d.get_last_lr()[0])
 
-        if (epoch + 1) % 5 == 0 or epoch == 0:
-            print(
-                f"  epoch {epoch + 1}/{epochs}  "
-                f"G={avg_g:.4f} D={avg_d:.4f} L1={avg_l1:.4f}  "
-                f"lr_g={sched_g.get_last_lr()[0]:.6f}"
+        # 精简日志：每 10 epoch 或首尾 epoch 打印一行
+        if (epoch + 1) % 10 == 0 or epoch == 0 or epoch == epochs - 1:
+            tqdm.write(
+                f"  [{epoch+1:>3}/{epochs}]  "
+                f"G={avg['g']:.3f}  D={avg['d']:.3f}  "
+                f"L1={avg['l1']:.4f}  adv={avg['adv']:.3f}  fm={avg['fm']:.4f}  "
+                f"δ={avg['delta']:.4f}"
             )
 
-        # 用 L1 部分来选最佳模型（L1 反映还原质量）
-        if avg_l1 < best_loss:
-            best_loss = avg_l1
+        # 用综合 generator loss 选最佳模型
+        if avg["g"] < best_loss:
+            best_loss = avg["g"]
             torch.save(gen.state_dict(), MODEL_DIR / "hachimi_unet_best.pt")
+
+        # 每 50 epoch 保存中间曲线
+        if (epoch + 1) % 50 == 0:
+            plot_curves(history, MODEL_DIR / "training_curves.png")
 
     torch.save(gen.state_dict(), MODEL_DIR / "hachimi_unet_final.pt")
     torch.save(disc.state_dict(), MODEL_DIR / "hachimi_disc.pt")
-    print(f"Done. Best L1: {best_loss:.4f}")
+    plot_curves(history, MODEL_DIR / "training_curves.png")
+    print(f"Done. Best G_loss: {best_loss:.4f}")
     print(f"Models saved to {MODEL_DIR}/")
 
 
@@ -206,9 +278,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=120)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr-g", type=float, default=1e-3)
-    parser.add_argument("--lr-d", type=float, default=1e-4)
-    parser.add_argument("--lambda-l1", type=float, default=10.0)
-    parser.add_argument("--lambda-adv", type=float, default=1.0)
+    parser.add_argument("--lr-d", type=float, default=5e-4)
+    parser.add_argument("--lambda-l1", type=float, default=2.0)
+    parser.add_argument("--lambda-adv", type=float, default=2.0)
+    parser.add_argument("--lambda-fm", type=float, default=2.0)
     parser.add_argument(
         "--device", choices=["auto", "mps", "cpu", "cuda"], default="auto"
     )
@@ -225,6 +298,7 @@ if __name__ == "__main__":
         lr_d=args.lr_d,
         lambda_l1=args.lambda_l1,
         lambda_adv=args.lambda_adv,
+        lambda_fm=args.lambda_fm,
         exclude_names=args.exclude,
         device=selected_device,
         amp=args.amp,
