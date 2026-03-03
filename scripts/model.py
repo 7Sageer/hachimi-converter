@@ -47,14 +47,9 @@ class ConvModule(nn.Module):
     def forward(self, x):
         # x: (B, T, d_model)
         x = self.layer_norm(x)
-        x = self.pointwise1(x)
-        x = x * torch.sigmoid(x)  # GLU (split-free, 等价于 x * sigmoid(x))
-        # 注意：标准 GLU 是 split+gate，这里用 Swish 替代简化实现
-        # 修正：使用标准 GLU
-        # 重新实现：pointwise 输出 2*d，split 后 gate
-        # 已在 pointwise1 输出 2*d_model
+        x = self.pointwise1(x)  # (B, T, 2*d_model)
         a, b = x.chunk(2, dim=-1)
-        x = a * torch.sigmoid(b)
+        x = a * torch.sigmoid(b)  # 标准 GLU gate
         x = x.transpose(1, 2)  # (B, d_model, T)
         x = self.depthwise(x)
         x = self.batch_norm(x)
@@ -205,6 +200,7 @@ class HachimiConformer(nn.Module):
 
     def forward(self, x):
         # x: (B, 1, n_mels, T)
+        identity = x  # 保存输入用于全局残差
         B, _, M, T = x.shape
 
         # (B, 1, M, T) → (B, T, M)
@@ -222,8 +218,10 @@ class HachimiConformer(nn.Module):
         for block in self.decoder:
             dec = block(dec, enc)
 
-        # 输出投影
-        out = self.output_proj(dec)  # (B, T, M)
+        # 输出投影 → delta
+        delta = self.output_proj(dec)  # (B, T, M)
+        delta = delta.transpose(1, 2).unsqueeze(1)  # (B, 1, M, T)
 
-        # (B, T, M) → (B, 1, M, T)
-        return out.transpose(1, 2).unsqueeze(1)
+        # 全局残差：output = input + delta
+        # Conformer 只学习风格差异，高频细节通过 identity 保留
+        return identity + delta

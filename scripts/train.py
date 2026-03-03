@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Train hachimi style transfer Conformer with PatchGAN adversarial loss."""
 
-import os
 from pathlib import Path
 
 import torch
@@ -21,16 +20,14 @@ MODEL_DIR.mkdir(exist_ok=True)
 DEFAULT_DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
 
 
-def get_default_num_workers():
-    cpu_count = os.cpu_count() or 4
-    return max(2, min(8, cpu_count - 2))
-
-
 class PairedMelDataset(Dataset):
-    """Load paired original/hachimi segments as mel spectrograms."""
+    """Load paired original/hachimi segments as mel spectrograms.
+
+    所有 mel 在 __init__ 时预计算并缓存在内存中，避免训练时反复读盘和 CPU 计算。
+    """
 
     def __init__(self, data_dir: Path, exclude_names=None):
-        self.pairs = []
+        pairs = []
         hach_files = sorted(data_dir.glob("*_hach_*.wav"))
         for hf in hach_files:
             if exclude_names and any(
@@ -39,32 +36,36 @@ class PairedMelDataset(Dataset):
                 continue
             of = data_dir / hf.name.replace("_hach_", "_orig_")
             if of.exists():
-                self.pairs.append((of, hf))
-        print(f"Found {len(self.pairs)} paired segments")
+                pairs.append((of, hf))
+        print(f"Found {len(pairs)} paired segments, pre-computing mels...")
+
+        self.cached_mels = []
+        for orig_path, hach_path in tqdm(pairs, desc="Caching mels"):
+            orig_wav, _ = torchaudio.load(orig_path)
+            hach_wav, _ = torchaudio.load(hach_path)
+
+            if orig_wav.shape[0] > 1:
+                orig_wav = orig_wav.mean(dim=0, keepdim=True)
+            if hach_wav.shape[0] > 1:
+                hach_wav = hach_wav.mean(dim=0, keepdim=True)
+
+            orig_mel = normalize(log_mel(mel_spectrogram(orig_wav.squeeze(0))))
+            hach_mel = normalize(log_mel(mel_spectrogram(hach_wav.squeeze(0))))
+
+            min_t = min(orig_mel.shape[-1], hach_mel.shape[-1])
+            pad_t = ((min_t + 7) // 8) * 8
+            orig_mel = self._pad_time(orig_mel[:, :, :min_t], pad_t)
+            hach_mel = self._pad_time(hach_mel[:, :, :min_t], pad_t)
+
+            self.cached_mels.append((orig_mel, hach_mel))
+
+        print(f"Cached {len(self.cached_mels)} mel pairs in memory")
 
     def __len__(self):
-        return len(self.pairs)
+        return len(self.cached_mels)
 
     def __getitem__(self, idx):
-        orig_path, hach_path = self.pairs[idx]
-
-        orig_wav, _ = torchaudio.load(orig_path)
-        hach_wav, _ = torchaudio.load(hach_path)
-
-        if orig_wav.shape[0] > 1:
-            orig_wav = orig_wav.mean(dim=0, keepdim=True)
-        if hach_wav.shape[0] > 1:
-            hach_wav = hach_wav.mean(dim=0, keepdim=True)
-
-        orig_mel = normalize(log_mel(mel_spectrogram(orig_wav.squeeze(0))))
-        hach_mel = normalize(log_mel(mel_spectrogram(hach_wav.squeeze(0))))
-
-        min_t = min(orig_mel.shape[-1], hach_mel.shape[-1])
-        pad_t = ((min_t + 7) // 8) * 8
-        orig_mel = self._pad_time(orig_mel[:, :, :min_t], pad_t)
-        hach_mel = self._pad_time(hach_mel[:, :, :min_t], pad_t)
-
-        return orig_mel, hach_mel
+        return self.cached_mels[idx]
 
     def _pad_time(self, mel, target_t):
         pad = target_t - mel.shape[-1]
@@ -82,17 +83,11 @@ def train(
     lambda_adv=1.0,
     exclude_names=None,
     device=DEFAULT_DEVICE,
-    num_workers=None,
-    prefetch_factor=4,
-    persistent_workers=True,
     amp=False,
 ):
     dataset = PairedMelDataset(DATA_DIR, exclude_names=exclude_names)
-    if num_workers is None:
-        num_workers = get_default_num_workers()
 
     # CUDA 优化
-    use_pin_memory = device == "cuda"
     if device == "cuda":
         torch.backends.cudnn.benchmark = True
 
@@ -101,17 +96,15 @@ def train(
     scaler_g = torch.amp.GradScaler("cuda", enabled=use_amp)
     scaler_d = torch.amp.GradScaler("cuda", enabled=use_amp)
 
-    loader_kwargs = {
-        "batch_size": batch_size,
-        "shuffle": True,
-        "drop_last": True,  # GAN 训练需要固定 batch size
-        "num_workers": num_workers,
-        "pin_memory": use_pin_memory,
-    }
-    if num_workers > 0:
-        loader_kwargs["persistent_workers"] = persistent_workers
-        loader_kwargs["prefetch_factor"] = prefetch_factor
-    loader = DataLoader(dataset, **loader_kwargs)
+    # 数据已在内存中，num_workers=0 避免进程间序列化开销
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=0,
+        pin_memory=(device == "cuda"),
+    )
 
     # Generator (Conformer) + Discriminator (PatchGAN)
     gen = HachimiConformer(n_mels=N_MELS).to(device)
@@ -151,8 +144,8 @@ def train(
 
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{epochs}", leave=False)
         for orig_mel, hach_mel in pbar:
-            orig_mel = orig_mel.to(device, non_blocking=use_pin_memory)
-            hach_mel = hach_mel.to(device, non_blocking=use_pin_memory)
+            orig_mel = orig_mel.to(device, non_blocking=True)
+            hach_mel = hach_mel.to(device, non_blocking=True)
 
             with torch.amp.autocast("cuda", enabled=use_amp):
                 fake_mel = gen(orig_mel)
@@ -219,9 +212,6 @@ if __name__ == "__main__":
     parser.add_argument(
         "--device", choices=["auto", "mps", "cpu", "cuda"], default="auto"
     )
-    parser.add_argument("--num-workers", type=int, default=None)
-    parser.add_argument("--prefetch-factor", type=int, default=4)
-    parser.add_argument("--no-persistent-workers", action="store_true")
     parser.add_argument("--amp", action="store_true", help="启用混合精度训练(仅CUDA)")
     parser.add_argument(
         "--exclude", nargs="*", help="Song names to exclude from training"
@@ -237,8 +227,5 @@ if __name__ == "__main__":
         lambda_adv=args.lambda_adv,
         exclude_names=args.exclude,
         device=selected_device,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        persistent_workers=not args.no_persistent_workers,
         amp=args.amp,
     )
