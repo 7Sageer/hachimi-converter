@@ -200,7 +200,6 @@ class HachimiConformer(nn.Module):
 
     def forward(self, x):
         # x: (B, 1, n_mels, T)
-        identity = x  # 保存输入用于全局残差
         B, _, M, T = x.shape
 
         # (B, 1, M, T) → (B, T, M)
@@ -218,10 +217,8 @@ class HachimiConformer(nn.Module):
         for block in self.decoder:
             dec = block(dec, enc)
 
-        # 输出投影 → delta
-        delta = self.output_proj(dec)  # (B, T, M)
-        delta = delta.transpose(1, 2).unsqueeze(1)  # (B, 1, M, T)
+        # 输出投影 → 完整 mel
+        out = self.output_proj(dec)  # (B, T, M)
 
-        # 全局残差：output = input + delta
-        # Conformer 只学习风格差异，高频细节通过 identity 保留
-        return identity + delta
+        # (B, T, M) → (B, 1, M, T)
+        return out.transpose(1, 2).unsqueeze(1)
