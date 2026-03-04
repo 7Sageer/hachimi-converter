@@ -30,12 +30,20 @@ python scripts/train.py --epochs 200
 python scripts/train.py --exclude song_name    # hold out songs for eval
 python scripts/train.py --amp                  # AMP mixed precision (CUDA only)
 
+# Train Flow Matching (recommended, replaces GAN)
+python scripts/train_fm.py                     # default 120 epochs
+python scripts/train_fm.py --epochs 200
+python scripts/train_fm.py --device mps --batch-size 32
+
 # Fine-tune HiFi-GAN vocoder on hachimi data
 python scripts/train_vocoder.py
 
 # Inference (convert audio)
-python scripts/inference.py input.wav output.wav [duration] [offset]
-python scripts/batch_inference.py              # batch convert preset samples
+python scripts/inference.py input.wav output.wav [duration] [offset]        # GAN model
+python scripts/inference_fm.py input.wav output.wav [duration] [offset]     # Flow Matching
+python scripts/inference_fm.py input.wav output.wav --steps 20              # more ODE steps = better quality
+python scripts/batch_inference.py              # auto-detect FM or GAN model
+python scripts/batch_inference.py --fm --steps 10   # force Flow Matching
 
 # Visualize mel spectrogram comparison
 python scripts/visualize.py
@@ -47,7 +55,11 @@ Download scripts require a proxy at `http://localhost:10808` (hardcoded in `down
 
 ## Architecture
 
-**Inference pipeline:** input wav → mel spectrogram → log → normalize [0,1] → U-Net → denormalize → clamp → HiFi-GAN vocoder → output wav
+**GAN pipeline:** input wav → mel spectrogram → log → normalize [0,1] → U-Net → denormalize → clamp → HiFi-GAN vocoder → output wav
+
+**Flow Matching pipeline:** input wav → mel → log → normalize → Euler ODE (N steps through FlowNet) → denormalize → clamp → HiFi-GAN → output wav
+
+Flow Matching learns a velocity field v(x_t, t) that transports source_mel → target_mel along straight (optimal transport) paths. At inference, start from source_mel and integrate the ODE with Euler steps.
 
 **Key mel parameters (must stay consistent across all scripts):**
 - SR=22050, N_FFT=1024, HOP=256, WIN=1024, N_MELS=80, FMIN=0, FMAX=8000
@@ -58,12 +70,15 @@ Download scripts require a proxy at `http://localhost:10808` (hardcoded in `down
 
 - `scripts/mel_utils.py` — Single source of truth for mel parameters and transforms. All other scripts import from here. Functions: mel_spectrogram, log_mel, normalize, denormalize, exp_mel.
 - `scripts/model.py` — HachimiUNet: 3-level encoder-decoder with skip connections, base_ch=32, MaxPool2d(2) downsampling, ConvTranspose2d upsampling. Input/output: (B,1,80,T). Time dim must be padded to multiple of 8.
+- `scripts/model_fm.py` — HachimiFlowNet: same U-Net architecture as HachimiUNet but with FiLM time conditioning (sinusoidal embedding → MLP → scale+shift in each ConvBlock). Input: (B,1,80,T) + scalar t. Output: velocity (B,1,80,T).
 - `scripts/hifigan_model.py` — HiFi-GAN Generator vocoder (pretrained, frozen). Expects log-mel input (B,80,T). Config at `models/hifigan/config.json`.
 - `scripts/discriminator.py` — PatchDiscriminator: 2D PatchGAN on mel spectrograms, ~16-frame receptive field (~186ms).
 - `scripts/losses.py` — LSGAN loss functions for generator and discriminator.
 - `scripts/train.py` — GAN training: L1 + PatchGAN adversarial (LSGAN). AdamW, cosine annealing. Device: CUDA → MPS → CPU. Supports AMP mixed precision on CUDA. Saves best + final to `models/`.
+- `scripts/train_fm.py` — Flow Matching training: single MSE velocity-prediction loss. No discriminator. Dramatically simpler than GAN. Saves to `models/hachimi_fm_{best,final}.pt`.
 - `scripts/train_vocoder.py` — Fine-tunes HiFi-GAN vocoder on hachimi paired data to adapt to U-Net output distribution.
 - `scripts/inference.py` — Loads U-Net + HiFi-GAN, pads time to multiple of 8, clamps denormalized output to [-11.5, 0.5].
+- `scripts/inference_fm.py` — Flow Matching inference with Euler ODE solver. Default 10 steps. Configurable via --steps.
 - `scripts/batch_inference.py` — Batch converts preset sample list using `inference.convert()`.
 
 ### Data pipeline

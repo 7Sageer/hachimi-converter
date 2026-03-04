@@ -1,224 +1,180 @@
 #!/usr/bin/env python3
-"""Conformer Encoder-Decoder for hachimi style transfer.
+"""U-Net + Bottleneck Attention + Gated Skip for hachimi style transfer.
 
-替代 U-Net 架构：无 skip connection，强制模型学习完整的风格转换映射。
-Conformer encoder 捕获长距离时序依赖，Transformer decoder 生成目标 mel。
+基于原始 U-Net（效果已验证），增加两个针对性改进：
+1. Bottleneck Self-Attention — 捕获长距离时序依赖（"哈基→米"）
+2. Gated Skip Connection — 让模型可以选择性修改低频特征
 """
 
-import math
 import torch
 import torch.nn as nn
 
 
-class SinusoidalPE(nn.Module):
-    """正弦位置编码，支持任意长度序列。"""
+class ConvBlock(nn.Module):
+    """两层 3×3 卷积 + BN + ReLU。"""
 
-    def __init__(self, d_model, max_len=8000, dropout=0.1):
+    def __init__(self, in_ch, out_ch):
         super().__init__()
-        self.dropout = nn.Dropout(dropout)
-        pe = torch.zeros(max_len, d_model)
-        pos = torch.arange(max_len).unsqueeze(1).float()
-        div = torch.exp(torch.arange(0, d_model, 2).float() * (-math.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(pos * div)
-        pe[:, 1::2] = torch.cos(pos * div)
-        self.register_buffer("pe", pe.unsqueeze(0))  # (1, max_len, d_model)
+        self.conv = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(out_ch, out_ch, 3, padding=1),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
 
     def forward(self, x):
-        # x: (B, T, d_model)
-        x = x + self.pe[:, :x.size(1)]
-        return self.dropout(x)
+        return self.conv(x)
 
 
-class ConvModule(nn.Module):
-    """Conformer 卷积模块：Pointwise → GLU → DepthwiseConv → BN → Swish → Pointwise → Dropout"""
+class BottleneckAttention(nn.Module):
+    """在 U-Net bottleneck 位置沿时间轴做 self-attention。
 
-    def __init__(self, d_model, kernel_size=31, dropout=0.1):
-        super().__init__()
-        self.layer_norm = nn.LayerNorm(d_model)
-        self.pointwise1 = nn.Linear(d_model, d_model * 2)
-        self.depthwise = nn.Conv1d(
-            d_model, d_model, kernel_size,
-            padding=(kernel_size - 1) // 2, groups=d_model,
-        )
-        self.batch_norm = nn.BatchNorm1d(d_model)
-        self.pointwise2 = nn.Linear(d_model, d_model)
-        self.dropout = nn.Dropout(dropout)
-
-    def forward(self, x):
-        # x: (B, T, d_model)
-        x = self.layer_norm(x)
-        x = self.pointwise1(x)  # (B, T, 2*d_model)
-        a, b = x.chunk(2, dim=-1)
-        x = a * torch.sigmoid(b)  # 标准 GLU gate
-        x = x.transpose(1, 2)  # (B, d_model, T)
-        x = self.depthwise(x)
-        x = self.batch_norm(x)
-        x = x.transpose(1, 2)  # (B, T, d_model)
-        x = torch.nn.functional.silu(x)
-        x = self.pointwise2(x)
-        return self.dropout(x)
-
-
-class ConformerBlock(nn.Module):
-    """Macaron-style Conformer block: 0.5*FFN → MHSA → ConvModule → 0.5*FFN → LayerNorm"""
-
-    def __init__(self, d_model=256, n_heads=4, ff_dim=1024, conv_kernel=31, dropout=0.1):
-        super().__init__()
-        # 前半 FFN
-        self.ffn1_norm = nn.LayerNorm(d_model)
-        self.ffn1 = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, d_model),
-            nn.Dropout(dropout),
-        )
-        # MHSA
-        self.mhsa_norm = nn.LayerNorm(d_model)
-        self.mhsa = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.mhsa_dropout = nn.Dropout(dropout)
-        # ConvModule
-        self.conv_module = ConvModule(d_model, conv_kernel, dropout)
-        # 后半 FFN
-        self.ffn2_norm = nn.LayerNorm(d_model)
-        self.ffn2 = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, d_model),
-            nn.Dropout(dropout),
-        )
-        # 最终 LayerNorm
-        self.final_norm = nn.LayerNorm(d_model)
-
-    def forward(self, x):
-        # x: (B, T, d_model)
-        # 0.5 * FFN
-        x = x + 0.5 * self.ffn1(self.ffn1_norm(x))
-        # MHSA
-        residual = x
-        x_norm = self.mhsa_norm(x)
-        attn_out, _ = self.mhsa(x_norm, x_norm, x_norm)
-        x = residual + self.mhsa_dropout(attn_out)
-        # ConvModule
-        x = x + self.conv_module(x)
-        # 0.5 * FFN
-        x = x + 0.5 * self.ffn2(self.ffn2_norm(x))
-        # Final LayerNorm
-        return self.final_norm(x)
-
-
-class TransformerDecoderBlock(nn.Module):
-    """Transformer decoder block: Self-Attn + Cross-Attn + FFN（无因果掩码）。"""
-
-    def __init__(self, d_model=256, n_heads=4, ff_dim=1024, dropout=0.1):
-        super().__init__()
-        self.self_attn_norm = nn.LayerNorm(d_model)
-        self.self_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.self_attn_dropout = nn.Dropout(dropout)
-
-        self.cross_attn_norm = nn.LayerNorm(d_model)
-        self.cross_attn = nn.MultiheadAttention(d_model, n_heads, dropout=dropout, batch_first=True)
-        self.cross_attn_dropout = nn.Dropout(dropout)
-
-        self.ffn_norm = nn.LayerNorm(d_model)
-        self.ffn = nn.Sequential(
-            nn.Linear(d_model, ff_dim),
-            nn.SiLU(),
-            nn.Dropout(dropout),
-            nn.Linear(ff_dim, d_model),
-            nn.Dropout(dropout),
-        )
-
-    def forward(self, x, memory):
-        # Self-Attention（双向，无因果掩码）
-        residual = x
-        x_norm = self.self_attn_norm(x)
-        attn_out, _ = self.self_attn(x_norm, x_norm, x_norm)
-        x = residual + self.self_attn_dropout(attn_out)
-        # Cross-Attention
-        residual = x
-        x_norm = self.cross_attn_norm(x)
-        attn_out, _ = self.cross_attn(x_norm, memory, memory)
-        x = residual + self.cross_attn_dropout(attn_out)
-        # FFN
-        x = x + self.ffn(self.ffn_norm(x))
-        return x
-
-
-class HachimiConformer(nn.Module):
-    """Conformer Encoder-Decoder for mel-to-mel style transfer.
-
-    Input/Output: (B, 1, 80, T) — 与 U-Net 接口完全兼容。
+    输入 (B, C, H, T_down)，将 C*H 投影到 attn_dim，
+    沿 T_down 维做多头自注意力，捕获全局时序依赖。
     """
 
-    def __init__(
-        self,
-        n_mels=80,
-        d_model=256,
-        n_heads=4,
-        ff_dim=1024,
-        conv_kernel=31,
-        n_enc=4,
-        n_dec=4,
-        dropout=0.1,
-    ):
+    def __init__(self, channels, height, attn_dim=256, n_heads=4, num_layers=2, dropout=0.1):
         super().__init__()
-        self.n_mels = n_mels
-        self.d_model = d_model
+        full_dim = channels * height
+        self.channels = channels
+        self.height = height
 
-        # 输入投影: mel bins → d_model
-        self.input_proj = nn.Linear(n_mels, d_model)
-        self.pos_enc = SinusoidalPE(d_model, dropout=dropout)
+        self.norm = nn.LayerNorm(full_dim)
+        self.proj_in = nn.Linear(full_dim, attn_dim)
+        self.proj_out = nn.Linear(attn_dim, full_dim)
 
-        # Conformer Encoder
-        self.encoder = nn.ModuleList([
-            ConformerBlock(d_model, n_heads, ff_dim, conv_kernel, dropout)
-            for _ in range(n_enc)
-        ])
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=attn_dim, nhead=n_heads,
+            dim_feedforward=attn_dim * 4,
+            dropout=dropout, batch_first=True,
+            activation="gelu",
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
 
-        # Transformer Decoder
-        self.decoder_input_proj = nn.Linear(n_mels, d_model)
-        self.decoder_pos_enc = SinusoidalPE(d_model, dropout=dropout)
-        self.decoder = nn.ModuleList([
-            TransformerDecoderBlock(d_model, n_heads, ff_dim, dropout)
-            for _ in range(n_dec)
-        ])
+        # 初始化 proj_out 为近零，让残差连接初期 ≈ identity
+        nn.init.zeros_(self.proj_out.weight)
+        nn.init.zeros_(self.proj_out.bias)
 
-        # 输出投影: d_model → mel bins
-        self.output_proj = nn.Linear(d_model, n_mels)
+    def forward(self, x):
+        # x: (B, C, H, T)
+        B, C, H, T = x.shape
+        # 展平为 (B, T, C*H)
+        x_flat = x.permute(0, 3, 1, 2).reshape(B, T, C * H)
+        # 残差 attention
+        h = self.norm(x_flat)
+        h = self.proj_in(h)       # (B, T, attn_dim)
+        h = self.encoder(h)
+        h = self.proj_out(h)      # (B, T, C*H)
+        x_flat = x_flat + h       # 残差连接
+        # 还原为 (B, C, H, T)
+        return x_flat.reshape(B, T, C, H).permute(0, 2, 3, 1)
 
-        self._init_weights()
 
-    def _init_weights(self):
-        """Xavier 初始化线性层。"""
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.xavier_uniform_(m.weight)
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
+class GatedSkip(nn.Module):
+    """学习 skip connection 的门控：gate = sigmoid(conv(skip))。
+
+    gate 可以学习在某些频率 bin 或时间位置"关闭"skip，
+    让 decoder 自由修改这些区域（如低频基音、时序转折点）。
+    """
+
+    def __init__(self, channels):
+        super().__init__()
+        self.gate_conv = nn.Sequential(
+            nn.Conv2d(channels, channels, 1),
+            nn.Sigmoid(),
+        )
+        # 初始化 gate bias 为 +2，sigmoid(2)≈0.88，默认大部分特征通过
+        # 这保持了与原始 U-Net 相近的初始行为
+        nn.init.zeros_(self.gate_conv[0].weight)
+        nn.init.constant_(self.gate_conv[0].bias, 2.0)
+
+    def forward(self, skip):
+        return self.gate_conv(skip) * skip
+
+
+class HachimiUNet(nn.Module):
+    """U-Net + Bottleneck Attention + Gated Skip for mel spectrogram style transfer.
+
+    Input/Output: (B, 1, 80, T) — 与原始 U-Net 接口完全兼容。
+    """
+
+    def __init__(self, n_mels=80, base_ch=32):
+        super().__init__()
+        # Encoder
+        self.enc1 = ConvBlock(1, base_ch)          # (B, 32, 80, T)
+        self.enc2 = ConvBlock(base_ch, base_ch * 2) # (B, 64, 40, T/2)
+        self.enc3 = ConvBlock(base_ch * 2, base_ch * 4)  # (B, 128, 20, T/4)
+
+        # Bottleneck
+        self.bottleneck = ConvBlock(base_ch * 4, base_ch * 8)  # (B, 256, 10, T/8)
+
+        # Bottleneck Self-Attention（沿时间轴）
+        bt_h = n_mels // 8  # 3次 MaxPool2d 后的 height = 80//8 = 10
+        self.attention = BottleneckAttention(
+            channels=base_ch * 8,  # 256
+            height=bt_h,           # 10
+            attn_dim=256,
+            n_heads=4,
+            num_layers=2,
+            dropout=0.1,
+        )
+
+        # Gated Skip Connections
+        self.gate1 = GatedSkip(base_ch)
+        self.gate2 = GatedSkip(base_ch * 2)
+        self.gate3 = GatedSkip(base_ch * 4)
+
+        # Decoder — upsample + conv 避免棋盘伪影
+        self.up3 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 8, base_ch * 4, 3, padding=1),
+        )
+        self.dec3 = ConvBlock(base_ch * 8, base_ch * 4)
+        self.up2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 4, base_ch * 2, 3, padding=1),
+        )
+        self.dec2 = ConvBlock(base_ch * 4, base_ch * 2)
+        self.up1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode="nearest"),
+            nn.Conv2d(base_ch * 2, base_ch, 3, padding=1),
+        )
+        self.dec1 = ConvBlock(base_ch * 2, base_ch)
+
+        self.final = nn.Conv2d(base_ch, 1, 1)
+        self.pool = nn.MaxPool2d(2)
 
     def forward(self, x):
         # x: (B, 1, n_mels, T)
-        B, _, M, T = x.shape
+        e1 = self.enc1(x)
+        e2 = self.enc2(self.pool(e1))
+        e3 = self.enc3(self.pool(e2))
 
-        # (B, 1, M, T) → (B, T, M)
-        x_seq = x.squeeze(1).transpose(1, 2)
+        b = self.bottleneck(self.pool(e3))
 
-        # Encoder
-        enc = self.input_proj(x_seq)  # (B, T, d_model)
-        enc = self.pos_enc(enc)
-        for block in self.encoder:
-            enc = block(enc)
+        # Bottleneck Attention（全局时序建模）
+        b = self.attention(b)
 
-        # Decoder（输入也是原始 mel，让 decoder 通过 cross-attn 从 encoder 获取风格信息）
-        dec = self.decoder_input_proj(x_seq)  # (B, T, d_model)
-        dec = self.decoder_pos_enc(dec)
-        for block in self.decoder:
-            dec = block(dec, enc)
+        # Decoder with Gated Skip Connections
+        d3 = self.up3(b)
+        d3 = self._pad_cat(d3, self.gate3(e3))
+        d3 = self.dec3(d3)
 
-        # 输出投影 → 完整 mel
-        out = self.output_proj(dec)  # (B, T, M)
+        d2 = self.up2(d3)
+        d2 = self._pad_cat(d2, self.gate2(e2))
+        d2 = self.dec2(d2)
 
-        # (B, T, M) → (B, 1, M, T)
-        return out.transpose(1, 2).unsqueeze(1)
+        d1 = self.up1(d2)
+        d1 = self._pad_cat(d1, self.gate1(e1))
+        d1 = self.dec1(d1)
+
+        return self.final(d1)
+
+    def _pad_cat(self, x, skip):
+        """Pad x to match skip's spatial dims, then concat."""
+        dh = skip.shape[2] - x.shape[2]
+        dw = skip.shape[3] - x.shape[3]
+        x = nn.functional.pad(x, [0, dw, 0, dh])
+        return torch.cat([x, skip], dim=1)

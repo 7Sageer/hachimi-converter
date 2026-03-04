@@ -12,7 +12,7 @@ import torchaudio
 from discriminator import PatchDiscriminator
 from losses import gan_loss_d, gan_loss_g, feature_matching_loss
 from mel_utils import N_MELS, log_mel, mel_spectrogram, normalize
-from model import HachimiConformer
+from model import HachimiUNet
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
@@ -160,7 +160,7 @@ def train(
     )
 
     # Generator (Conformer) + Discriminator (PatchGAN)
-    gen = HachimiConformer(n_mels=N_MELS).to(device)
+    gen = HachimiUNet(n_mels=N_MELS).to(device)
     disc = PatchDiscriminator(in_ch=1, base_ch=32).to(device)
 
     opt_g = torch.optim.AdamW(gen.parameters(), lr=lr_g, weight_decay=1e-4)
